@@ -39,7 +39,6 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/time.h>
-#include <sys/dir.h>
 #include <sys/stat.h>
 
 #include <sys/socket.h>
@@ -81,7 +80,13 @@
 #include "repo_susetags.h"
 #include "repo_content.h"
 #endif
+#ifdef ENABLE_HAIKU
+#include "repo_haiku.h"
+#include "solv_haiku.h"
+#endif
 #include "solv_xfopen.h"
+
+#include "solv.h"
 
 #ifdef FEDORA
 # define REPOINFO_PATH "/etc/yum.repos.d"
@@ -93,33 +98,6 @@
 #endif
 
 #define SOLVCACHE_PATH "/var/cache/solv"
-
-#define METADATA_EXPIRE (60 * 15)
-
-struct repoinfo {
-  Repo *repo;
-
-  char *alias;
-  char *name;
-  int enabled;
-  int autorefresh;
-  char *baseurl;
-  char *metalink;
-  char *mirrorlist;
-  char *path;
-  int type;
-  int pkgs_gpgcheck;
-  int repo_gpgcheck;
-  int priority;
-  int keeppackages;
-  int metadata_expire;
-  char **components;
-  int ncomponents;
-
-  unsigned char cookie[32];
-  unsigned char extcookie[32];
-  int incomplete;
-};
 
 #ifdef FEDORA
 char *
@@ -200,12 +178,6 @@ yum_substitute(Pool *pool, char *line)
   return line;
 }
 #endif
-
-#define TYPE_UNKNOWN	0
-#define TYPE_SUSETAGS	1
-#define TYPE_RPMMD	2
-#define TYPE_PLAINDIR	3
-#define TYPE_DEBIAN     4
 
 #ifndef NOSYSTEM
 static int
@@ -464,6 +436,21 @@ read_repoinfos(Pool *pool, int *nrepoinfosp)
     }
   qsort(repoinfos, nrepoinfos, sizeof(*repoinfos), read_repoinfos_sort);
   *nrepoinfosp = nrepoinfos;
+  return repoinfos;
+}
+
+#endif
+
+#ifdef HAIKU
+
+struct repoinfo *
+read_repoinfos(Pool *pool, int *nrepoinfosp)
+{
+  struct repoinfo *repoinfos = read_haiku_repoinfos(pool, nrepoinfosp);
+  if (!repoinfos)
+    return repoinfos;
+
+  qsort(repoinfos, *nrepoinfosp, sizeof(*repoinfos), read_repoinfos_sort);
   return repoinfos;
 }
 
@@ -985,6 +972,15 @@ checksig(Pool *sigpool, FILE *fp, FILE *sigfp)
   return r == 0 ? 1 : 0;
 }
 
+#elif defined(HAIKU)
+
+int
+checksig(Pool *sigpool, FILE *fp, FILE *sigfp)
+{
+  /* TODO: Implement! */
+  return 0;
+}
+
 #else
 
 static int
@@ -1070,6 +1066,9 @@ calc_checksum_stat(struct stat *stb, Id chktype, unsigned char *cookie, unsigned
 void
 setarch(Pool *pool)
 {
+#if defined(HAIKU) && defined(__HAIKU_ARCH_X86)
+  set_haiku_x86_pool_arch(pool);
+#else
   struct utsname un;
   if (uname(&un))
     {
@@ -1077,6 +1076,7 @@ setarch(Pool *pool)
       exit(1);
     }
   pool_setarch(pool, un.machine);
+#endif
 }
 
 char *
@@ -1713,6 +1713,10 @@ read_repos(Pool *pool, struct repoinfo *repoinfos, int nrepoinfos)
   if (stat(pool_prepend_rootdir_tmp(pool, "/var/lib/dpkg/status"), &stb))
     memset(&stb, 0, sizeof(stb));
 #endif
+#if defined(HAIKU)
+  memset(&stb, 0, sizeof(&stb));
+  get_haiku_installed_status(&stb);
+#endif
 #ifdef NOSYSTEM
   printf("no installed database:");
   memset(&stb, 0, sizeof(stb));
@@ -1760,6 +1764,10 @@ read_repos(Pool *pool, struct repoinfo *repoinfos, int nrepoinfos)
 	  fprintf(stderr, "installed db: %s\n", pool_errstr(pool));
 	  exit(1);
 	}
+#endif
+#if defined(HAIKU)
+        repo_add_haiku_installed_packages(repo, 0,
+          REPO_REUSE_REPODATA | REPO_USE_ROOTDIR);
 #endif
       writecachedrepo(repo, 0, 0, installedcookie);
     }
@@ -2020,6 +2028,32 @@ read_repos(Pool *pool, struct repoinfo *repoinfos, int nrepoinfos)
 	  fclose(fpr);
 	  if (!cinfo->incomplete)
 	    writecachedrepo(repo, 0, 0, cinfo->cookie);
+	  break;
+#endif
+
+#ifdef ENABLE_HAIKU
+        case TYPE_HAIKU:
+	  printf("haiku repo '%s':", cinfo->alias);
+          fp = open_haiku_repo_cache(cinfo);
+          if (!fp)
+            {
+              printf(" failed to open repo cache\n");
+	      repo_free(repo, 1);
+	      cinfo->repo = 0;
+              break;
+            }
+	  calc_checksum_fp(fp, REPOKEY_TYPE_SHA256, cinfo->cookie);
+	  if (usecachedrepo(repo, 0, cinfo->cookie, 1))
+	    {
+	      printf(" cached\n");
+              fclose(fp);
+	      break;
+	    }
+	  fclose(fp);
+	  printf(" fetching\n");
+
+	  repo_add_haiku_packages(repo, cinfo->alias, 0);
+
 	  break;
 #endif
 
@@ -2800,6 +2834,10 @@ main(int argc, char **argv)
 	  if (l <= 4 || strcmp(argv[i] + l - 4, ".deb"))
 	    continue;
 #endif
+#if defined(ENABLE_HAIKU) && defined(HAIKU)
+	  if (l <= 5 || strcmp(argv[i] + l - 5, ".hpkg"))
+	    continue;
+#endif
 	  if (access(argv[i], R_OK))
 	    {
 	      perror(argv[i]);
@@ -2815,6 +2853,9 @@ main(int argc, char **argv)
 #endif
 #if defined(ENABLE_DEBIAN) && defined(DEBIAN)
 	  p = repo_add_deb(commandlinerepo, (const char *)argv[i], REPO_REUSE_REPODATA|REPO_NO_INTERNALIZE);
+#endif
+#if defined(ENABLE_HAIKU) && defined(HAIKU)
+	  p = repo_add_haiku_package(commandlinerepo, (const char *)argv[i], REPO_REUSE_REPODATA|REPO_NO_INTERNALIZE);
 #endif
 	  if (!p)
 	    {
@@ -3238,6 +3279,9 @@ rerunsolver:
 #if defined(ENABLE_DEBIAN) && defined(DEBIAN)
 	  rundpkg("--remove", pool_id2str(pool, s->name), 0, rootdir);
 #endif
+#if defined(ENABLE_HAIKU) && defined(HAIKU)
+	  uninstall_haiku_package(s);
+#endif
 	  break;
 	case SOLVER_TRANSACTION_INSTALL:
 	case SOLVER_TRANSACTION_MULTIINSTALL:
@@ -3255,6 +3299,9 @@ rerunsolver:
 #endif
 #if defined(ENABLE_DEBIAN) && defined(DEBIAN)
 	  rundpkg("--install", "/dev/fd/3", fileno(fp), rootdir);
+#endif
+#if defined(ENABLE_HAIKU) && defined(HAIKU)
+	  install_haiku_package(fp);
 #endif
 	  fclose(fp);
 	  newpkgsfps[j] = 0;
